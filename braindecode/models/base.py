@@ -13,7 +13,7 @@ from braindecode.experiments.monitors import (
     compute_pred_labels_from_trial_preds,
     compute_preds_per_trial_from_crops,
 )
-from braindecode.experiments.stopcriteria import MaxEpochs
+from braindecode.experiments.stopcriteria import MaxEpochs, NoDecrease, Or
 from braindecode.datautil.iterators import (
     BalancedBatchSizeIterator,
     CropsFromTrialsIterator,
@@ -23,6 +23,7 @@ from braindecode.datautil.signal_target import SignalAndTarget
 from braindecode.models.util import to_dense_prediction_model
 from braindecode.torch_ext.schedulers import CosineAnnealing, ScheduledOptimizer
 from braindecode.torch_ext.util import np_to_var, var_to_np
+from braindecode.experiments.loggers import Printer, TensorboardWriter
 import logging
 
 log = logging.getLogger(__name__)
@@ -41,14 +42,18 @@ def find_optimizer(optimizer_name):
 
 
 class BaseModel(object):
-    def cuda(self):
+    def cuda(self, n_cuda=4):
         """Move underlying model to GPU."""
         self._ensure_network_exists()
         assert (
             not self.compiled
         ), "Call cuda before compiling model, otherwise optimization will not work"
-        self.network = self.network.cuda()
-        self.cuda = True
+        if n_cuda > 0:
+            self.network = self.network.cuda()
+            self.cuda = True
+        else:
+            self.cuda = False
+        self.n_cuda = n_cuda
         return self
 
     def parameters(self):
@@ -69,12 +74,15 @@ class BaseModel(object):
             self.compiled = False
 
     def compile(
-        self,
-        loss,
-        optimizer,
-        extra_monitors=None,
-        cropped=False,
-        iterator_seed=0,
+            self,
+            loss,
+            optimizer,
+            logdir,
+            extra_monitors=None,
+            cropped=False,
+            iterator_seed=0,
+            pre_load_dict_path=None,
+            input_time_length=None,
     ):
         """
         Setup training for this model.
@@ -94,7 +102,7 @@ class BaseModel(object):
         -------
 
         """
-        self.loss = loss
+
         self._ensure_network_exists()
         if cropped:
             model_already_dense = np.any(
@@ -112,26 +120,39 @@ class BaseModel(object):
         if not hasattr(optimizer, "step"):
             optimizer_class = find_optimizer(optimizer)
             optimizer = optimizer_class(self.network.parameters())
+        self.loss = loss
         self.optimizer = optimizer
+        self.logdir = logdir
         self.extra_monitors = extra_monitors
         # Already setting it here, so multiple calls to fit
         # will lead to different batches being drawn
         self.seed_rng = RandomState(iterator_seed)
         self.cropped = cropped
         self.compiled = True
+        self.pre_load = False
+        if pre_load_dict_path is not None:
+            self.pre_load = True
+            import torch
+            checkpoint = torch.load(pre_load_dict_path)
+            self.network.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.monitors = [LossMonitor(), ]
+            self.input_time_length = input_time_length
 
     def fit(
-        self,
-        train_X,
-        train_y,
-        epochs,
-        batch_size,
-        input_time_length=None,
-        validation_data=None,
-        model_constraint=None,
-        remember_best_column=None,
-        scheduler=None,
-        log_0_epoch=True,
+            self,
+            train_X,
+            train_y,
+            epochs,
+            no_decrease_epochs_to_stop,
+            batch_size,
+            input_time_length=None,
+            validation_data=None,
+            model_constraint=None,
+            remember_best_column=None,
+            scheduler=None,
+            log_0_epoch=True,
+            model_name=None,
     ):
         """
         Fit the model using the given training data.
@@ -209,14 +230,17 @@ class BaseModel(object):
                 seed=self.seed_rng.randint(0, np.iinfo(np.int32).max - 1),
             )
         if log_0_epoch:
-            stop_criterion = MaxEpochs(epochs)
+            max_epoch = MaxEpochs(epochs)
         else:
-            stop_criterion = MaxEpochs(epochs - 1)
+            max_epoch = MaxEpochs(epochs - 1)
+
+        early_stop = NoDecrease('valid_misclass', no_decrease_epochs_to_stop, min_decrease=1e-06)
+        stop_criterion = Or([max_epoch, early_stop])
         train_set = SignalAndTarget(train_X, train_y)
         optimizer = self.optimizer
         if scheduler is not None:
             assert (
-                scheduler == "cosine"
+                    scheduler == "cosine"
             ), "Supply either 'cosine' or None as scheduler."
             n_updates_per_epoch = sum(
                 [1 for _ in self.iterator.get_batches(train_set, shuffle=True)]
@@ -244,7 +268,7 @@ class BaseModel(object):
         else:
             valid_set = None
         test_set = None
-        self.monitors = [LossMonitor()]
+        self.monitors = [LossMonitor(), ]
         if self.cropped:
             self.monitors.append(CroppedTrialMisclassMonitor(input_time_length))
         else:
@@ -252,6 +276,8 @@ class BaseModel(object):
         if self.extra_monitors is not None:
             self.monitors.extend(self.extra_monitors)
         self.monitors.append(RuntimeMonitor())
+        mkdir(self.logdir)
+        loggers = [Printer(), TensorboardWriter(self.logdir)]
         exp = Experiment(
             self.network,
             train_set,
@@ -265,15 +291,31 @@ class BaseModel(object):
             stop_criterion=stop_criterion,
             remember_best_column=remember_best_column,
             run_after_early_stop=False,
-            cuda=self.cuda,
+            n_cuda=self.n_cuda,
             log_0_epoch=log_0_epoch,
             do_early_stop=(remember_best_column is not None),
+            loggers=loggers,
         )
-        exp.run()
+        best_v, best_model, best_optimizer = exp.run()
         self.epochs_df = exp.epochs_df
-        return exp
+        self.before_stop_df = exp.before_stop_df
+        import torch
+        import os
+        current_path = os.getcwd()
+        mkdir(current_path + "/model_dict")
+        if model_name is None:
+            path = current_path + "/model_dict" + "/{}_{}_model.pth".format(best_v, remember_best_column, )
+        else:
+            path = current_path + "/model_dict" + "/{}_{}_{}_model.pth".format(best_v, remember_best_column, model_name)
 
-    def evaluate(self, X, y):
+        torch.save({
+            'model_state_dict': best_model.module.state_dict(),
+            'optimizer_state_dict': best_optimizer.state_dict(),
+        }, path)
+        # return exp
+        return best_v, best_model, best_optimizer
+
+    def evaluate(self, X, y, batch_size=32):
         """
         Evaluate, i.e., compute metrics on given inputs and targets.
         
@@ -290,6 +332,7 @@ class BaseModel(object):
             Dictionary with result metrics.
 
         """
+
         X = _ensure_float32(X)
         stop_criterion = MaxEpochs(0)
         train_set = SignalAndTarget(X, y)
@@ -301,6 +344,47 @@ class BaseModel(object):
             loss_function = lambda outputs, targets: self.loss(
                 th.mean(outputs, dim=2), targets
             )
+
+        if self.pre_load:
+            # if we preload model dict, we need setting monitors, because usually it setted in self.fit() function
+            if self.cropped:
+                if self.input_time_length == None:
+                    raise ValueError(
+                        "preload cropped model need [input_time_length] to setting CroppedTrialMisclassMonitor "
+                    )
+                self.monitors.append(CroppedTrialMisclassMonitor(self.input_time_length))
+            else:
+                self.monitors.append(MisclassMonitor())
+            if self.extra_monitors is not None:
+                self.monitors.extend(self.extra_monitors)
+            self.monitors.append(RuntimeMonitor())
+            # setting iterator
+            if self.cropped:
+                self.network.eval()
+                test_input = np_to_var(
+                    np.ones(
+                        (1, train_set.X[0].shape[0], self.input_time_length)
+                        + train_set.X[0].shape[2:],
+                        dtype=np.float32,
+                    )
+                )
+                while len(test_input.size()) < 4:
+                    test_input = test_input.unsqueeze(-1)
+                if self.cuda:
+                    test_input = test_input.cuda()
+                out = self.network(test_input)
+                n_preds_per_input = out.cpu().data.numpy().shape[2]
+                self.iterator = CropsFromTrialsIterator(
+                    batch_size=batch_size,
+                    input_time_length=self.input_time_length,
+                    n_preds_per_input=n_preds_per_input,
+                    seed=self.seed_rng.randint(0, np.iinfo(np.int32).max - 1),
+                )
+            else:
+                self.iterator = BalancedBatchSizeIterator(
+                    batch_size=batch_size,
+                    seed=self.seed_rng.randint(0, np.iinfo(np.int32).max - 1),
+                )
 
         # reset runtime monitor if exists...
         for monitor in self.monitors:
@@ -319,7 +403,7 @@ class BaseModel(object):
             stop_criterion=stop_criterion,
             remember_best_column=None,
             run_after_early_stop=False,
-            cuda=self.cuda,
+            n_cuda=self.n_cuda,
             log_0_epoch=True,
             do_early_stop=False,
         )
@@ -335,7 +419,7 @@ class BaseModel(object):
         return result_dict
 
     def predict_classes(
-        self, X, threshold_for_binary_case=None, individual_crops=False
+            self, X, threshold_for_binary_case=None, individual_crops=False
     ):
         """
         Predict the labels for given input data.
@@ -389,7 +473,7 @@ class BaseModel(object):
         with th.no_grad():
             dummy_y = np.ones(len(X), dtype=np.int64)
             for b_X, _ in self.iterator.get_batches(
-                SignalAndTarget(X, dummy_y), False
+                    SignalAndTarget(X, dummy_y), False
             ):
                 b_X_var = np_to_var(b_X)
                 if self.cuda:
@@ -407,6 +491,12 @@ class BaseModel(object):
             outs_per_trial = np.concatenate(all_preds)
         return outs_per_trial
 
+    def load_model_dict(self, PATH):
+        import torch
+        checkpoint = torch.load(PATH)
+        self.network.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
 
 def _ensure_float32(X):
     if hasattr(X, "astype"):
@@ -414,3 +504,33 @@ def _ensure_float32(X):
     else:
         X = [x.astype(np.float32, copy=False) for x in X]
     return X
+
+
+def mkdir(path):
+    # 引入模块
+    import os
+
+    # 去除首位空格
+    path = path.strip()
+    # 去除尾部 \ 符号
+    path = path.rstrip("\\")
+
+    # 判断路径是否存在
+    # 存在     True
+    # 不存在   False
+    isExists = os.path.exists(path)
+
+    # 判断结果
+    if not isExists:
+        # 如果不存在则创建目录
+        # 创建目录操作函数
+        os.makedirs(path)
+
+        print
+        path + ' 创建成功'
+        return True
+    else:
+        # 如果目录存在则不创建，并提示目录已存在
+        print
+        path + ' 目录已存在'
+        return False

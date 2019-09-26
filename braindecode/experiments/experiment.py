@@ -157,27 +157,28 @@ class Experiment(object):
     """
 
     def __init__(
-        self,
-        model,
-        train_set,
-        valid_set,
-        test_set,
-        iterator,
-        loss_function,
-        optimizer,
-        model_constraint,
-        monitors,
-        stop_criterion,
-        remember_best_column,
-        run_after_early_stop,
-        model_loss_function=None,
-        batch_modifier=None,
-        cuda=True,
-        pin_memory=False,
-        do_early_stop=True,
-        reset_after_second_run=False,
-        log_0_epoch=True,
-        loggers=("print",),
+            self,
+            model,
+            train_set,
+            valid_set,
+            test_set,
+            iterator,
+            loss_function,
+            optimizer,
+            model_constraint,
+            monitors,
+            stop_criterion,
+            remember_best_column,
+            run_after_early_stop,
+            model_loss_function=None,
+            batch_modifier=None,
+            n_cuda=0,
+            pin_memory=False,
+            do_early_stop=True,
+            reset_after_second_run=False,
+            log_0_epoch=True,
+            loggers=("print",),
+            cropped=False,
     ):
         if run_after_early_stop or reset_after_second_run:
             assert do_early_stop == True, (
@@ -208,7 +209,7 @@ class Experiment(object):
         self.run_after_early_stop = run_after_early_stop
         self.model_loss_function = model_loss_function
         self.batch_modifier = batch_modifier
-        self.cuda = cuda
+        self.n_cuda = n_cuda
         self.epochs_df = pd.DataFrame()
         self.before_stop_df = None
         self.rememberer = None
@@ -217,6 +218,7 @@ class Experiment(object):
         self.reset_after_second_run = reset_after_second_run
         self.log_0_epoch = log_0_epoch
         self.loggers = loggers
+        self.cropped = cropped
 
     def run(self):
         """
@@ -231,11 +233,13 @@ class Experiment(object):
             log.info("Setup for second stop...")
             self.setup_after_stop_training()
         if self.run_after_early_stop:
-            log.info("Run until second stop...")
+            log.info("-" * 30)
+            log.info(' ')
+            log.info("Run until second stop (use train_set + vail_set)...")
             loss_to_reach = float(self.epochs_df["train_loss"].iloc[-1])
             self.run_until_second_stop()
             if (
-                float(self.epochs_df["valid_loss"].iloc[-1]) > loss_to_reach
+                    float(self.epochs_df["valid_loss"].iloc[-1]) > loss_to_reach
             ) and self.reset_after_second_run:
                 # if no valid loss was found below the best train loss on 1st
                 # run, reset model to the epoch with lowest valid_misclass
@@ -248,6 +252,8 @@ class Experiment(object):
                     self.epochs_df, self.model, self.optimizer
                 )
 
+        return self.rememberer.lowest_val, self.model, self.optimizer
+
     def setup_training(self):
         """
         Setup training, i.e. transform model to cuda,
@@ -259,9 +265,16 @@ class Experiment(object):
         if self.loggers == ("print",):
             self.loggers = [Printer()]
         self.epochs_df = pd.DataFrame()
-        if self.cuda:
-            assert th.cuda.is_available(), "Cuda not available"
-            self.model.cuda()
+
+        import torch
+        from torch import nn
+        device = torch.device("cuda:0" if (torch.cuda.is_available() and self.n_cuda > 0) else "cpu")
+        if (device.type == 'cuda') and (self.n_cuda > 1):
+            self.model = nn.DataParallel(self.model, list(range(self.n_cuda)))
+        if self.n_cuda > 0:
+            self.model.cuda(device)
+
+    # self.model.cuda()
 
     def run_until_first_stop(self):
         """
@@ -272,11 +285,11 @@ class Experiment(object):
 
     def run_until_second_stop(self):
         """
-        Run training and evaluation using combined training + validation set 
-        for training. 
-        
-        Runs until loss on validation  set decreases below loss on training set 
-        of best epoch or  until as many epochs trained after as before 
+        Run training and evaluation using combined training + validation set
+        for training.
+
+        Runs until loss on validation  set decreases below loss on training set
+        of best epoch or  until as many epochs trained after as before
         first stop.
         """
         datasets = self.datasets
@@ -290,7 +303,7 @@ class Experiment(object):
         """
         Run training and evaluation on given datasets until stop criterion is
         fulfilled.
-        
+
         Parameters
         ----------
         datasets: OrderedDict
@@ -314,7 +327,7 @@ class Experiment(object):
     def run_one_epoch(self, datasets, remember_best):
         """
         Run training and evaluation on given datasets for one epoch.
-        
+
         Parameters
         ----------
         datasets: OrderedDict
@@ -350,7 +363,7 @@ class Experiment(object):
     def train_batch(self, inputs, targets):
         """
         Train on given inputs and targets.
-        
+
         Parameters
         ----------
         inputs: `torch.autograd.Variable`
@@ -359,11 +372,13 @@ class Experiment(object):
         self.model.train()
         input_vars = np_to_var(inputs, pin_memory=self.pin_memory)
         target_vars = np_to_var(targets, pin_memory=self.pin_memory)
-        if self.cuda:
+        if self.n_cuda > 0:
             input_vars = input_vars.cuda()
             target_vars = target_vars.cuda()
         self.optimizer.zero_grad()
         outputs = self.model(input_vars)
+        if self.cropped:
+            outputs = th.mean(outputs, dim=2, keepdim=False)
         loss = self.loss_function(outputs, target_vars)
         if self.model_loss_function is not None:
             loss = loss + self.model_loss_function(self.model)
@@ -375,7 +390,7 @@ class Experiment(object):
     def eval_on_batch(self, inputs, targets):
         """
         Evaluate given inputs and targets.
-        
+
         Parameters
         ----------
         inputs: `torch.autograd.Variable`
@@ -391,10 +406,12 @@ class Experiment(object):
         with th.no_grad():
             input_vars = np_to_var(inputs, pin_memory=self.pin_memory)
             target_vars = np_to_var(targets, pin_memory=self.pin_memory)
-            if self.cuda:
+            if self.n_cuda > 0:
                 input_vars = input_vars.cuda()
                 target_vars = target_vars.cuda()
             outputs = self.model(input_vars)
+            if self.cropped:
+                outputs = th.mean(outputs, dim=2, keepdim=False)
             loss = self.loss_function(outputs, target_vars)
             if hasattr(outputs, "cpu"):
                 outputs = outputs.cpu().detach().numpy()
@@ -407,9 +424,9 @@ class Experiment(object):
     def monitor_epoch(self, datasets):
         """
         Evaluate one epoch for given datasets.
-        
+
         Stores results in `epochs_df`
-        
+
         Parameters
         ----------
         datasets: OrderedDict
@@ -489,10 +506,10 @@ class Experiment(object):
                 all_preds = np.delete(all_preds, range_to_delete, axis=0)
                 all_targets = np.delete(all_targets, range_to_delete, axis=0)
             assert (
-                np.sum(np.isnan(all_preds)) == 0
+                    np.sum(np.isnan(all_preds)) == 0
             ), "There are still nans in predictions"
             assert (
-                np.sum(np.isnan(all_targets)) == 0
+                    np.sum(np.isnan(all_targets)) == 0
             ), "There are still nans in targets"
             # add empty dimension
             # monitors expect n_batches x ...
@@ -530,8 +547,8 @@ class Experiment(object):
 
     def setup_after_stop_training(self):
         """
-        Setup training after first stop. 
-        
+        Setup training after first stop.
+
         Resets parameters to best parameters and updates stop criterion.
         """
         # also remember old monitor chans, will be put back into
